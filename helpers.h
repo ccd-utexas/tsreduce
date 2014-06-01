@@ -41,6 +41,7 @@ typedef struct
 
 void free_2d_array(char **array, size_t len);
 float *cast_double_array_to_float(double *d_ptr, size_t count);
+char *regex_escape_string(char *str);
 size_t get_matching_files(const char *pattern, char ***files);
 char *get_first_matching_file(char *pattern);
 int compare_double(const void *a, const void *b);
@@ -67,7 +68,7 @@ void serialize_time(ts_time t, char buf[24]);
 double ts_time_to_utc_hour(ts_time t);
 long double ts_time_to_bjd(ts_time t, double ra, double dec);
 double ts_difftime(ts_time a, ts_time b);
-char *prompt_user_input(char *message, char *fallback);
+char *prompt_user_input(char *message, char *fallback, bool allow_null);
 
 bool region_contains(uint16_t r[4], size_t x, size_t y);
 double region_mean(uint16_t r[4], double *data, size_t stride);

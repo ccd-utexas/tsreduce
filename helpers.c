@@ -16,6 +16,7 @@
 #include <math.h>
 #include <float.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/time.h>
 #include <sofa.h>
 #include <sofam.h>
@@ -348,7 +349,7 @@ int ts_time_to_tdb(ts_time t, double *tdb1, double *tdb2)
     double ut11, ut12;
     if (iauUtcut1(utc1, utc2, 0.3341, &ut11, &ut12))
         return 1;
-    double ut = fmod(fmod(ut11, 1.0) + fmod(ut12, 1.0), 1.0);
+    double ut = fmod(fmod(ut11, 1.0) + fmod(ut12, 1.0), 1.0) + 0.5;
     double dtr = iauDtdb(tt1, tt2, ut, 0, 0, 0);
 
     // Calculate TT -> TDB
@@ -479,6 +480,43 @@ int ts_versionsort(const struct dirent **a, const struct dirent **b)
         default:
             return state;
     }
+}
+
+char *regex_escape_string(char *prefix)
+{
+    size_t prefix_len = strlen(prefix);
+
+    // Count the number of regex metacharacters in the prefix
+    size_t escape_count = 0;
+    for (size_t i = 0; i < prefix_len; i++)
+        if (strchr(".^$*+?()[{\\|", prefix[i]))
+            escape_count++;
+
+    // Escape metacharacters with '\'
+    if (escape_count > 0)
+    {
+        char *new_prefix = calloc(prefix_len + escape_count + 1, sizeof(char));
+        if (!new_prefix)
+        {
+            printf("         Error allocating memory for escaped prefix.");
+            printf("         Returning unescaped string.");
+            return prefix;
+        }
+
+        size_t i = 0, j = 0;
+        while (i < prefix_len)
+        {
+            if (strchr(".^$*+?()[{\\|", prefix[i]))
+                new_prefix[j++] = '\\';
+
+            new_prefix[j++] = prefix[i++];
+        }
+
+        free(prefix);
+        prefix = new_prefix;
+    }
+
+    return prefix;
 }
 
 // Find files that match the given regex.
@@ -674,12 +712,12 @@ int init_ds9()
 #else
         const char *ds9_command = "ds9 -title tsreduce&";
 #endif
-        printf("Starting ds9...\n");
+        printf("        Starting ds9...\n");
         ts_exec_write(ds9_command, NULL, 0);
 
         do
         {
-            printf("Waiting...\n");
+            printf("        Waiting...\n");
             millisleep(1000);
             available = ts_exec_write(test_command, NULL, 0);
         } while (!available);
@@ -687,7 +725,13 @@ int init_ds9()
     return 0;
 }
 
-char *prompt_user_input(char *message, char *fallback)
+int send_sigint(int a, int b)
+{
+	raise(SIGINT);
+	return 0;
+}
+
+char *prompt_user_input(char *message, char *fallback, bool allow_null)
 {
     char *prompt = NULL;
     if (fallback)
@@ -702,6 +746,8 @@ char *prompt_user_input(char *message, char *fallback)
     }
 
 #ifdef USE_READLINE
+    // readline under windows eats SIGINT too, so restore it with an explicit handler.
+    rl_bind_key(3, send_sigint);
     rl_bind_key('\t', rl_complete);
     char *input = readline(prompt);
 
@@ -709,14 +755,23 @@ char *prompt_user_input(char *message, char *fallback)
     if (!input)
     {
         printf("\n");
+
+        if (allow_null)
+            return NULL;
+
         return strdup(strdup(fallback ? fallback : ""));
     }
 #else
     char inputbuf[1024];
     printf("%s", prompt);
-    fgets(inputbuf, 1024, stdin);
+    char *input = fgets(inputbuf, 1024, stdin);
+    if (!input && allow_null)
+    {
+        printf("\n");
+        return NULL;
+    }
 
-    char *input = strdup(inputbuf);
+    input = strdup(inputbuf);
 #endif
 
     // Trim whitespace and trailing newline

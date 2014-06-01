@@ -46,8 +46,13 @@ int framedata_remove_metadata(framedata *fd, const char *key);
 int framedata_subtract(framedata *fd, framedata *other);
 int framedata_subtract_normalized(framedata *fd, framedata *other);
 void framedata_subtract_bias(framedata *fd);
+int framedata_calibrate(framedata *frame, framedata *bias, framedata *dark, framedata *flat);
+int framedata_calibrate_load(framedata *frame, const char *bias_path, const char *dark_path, const char *flat_path);
 int framedata_divide(framedata *fd, framedata *other);
 int framedata_start_time(framedata *frame, ts_time *time);
 int framedata_estimate_translation(framedata *frame, framedata *reference, int32_t *xt, int32_t *yt);
+
+int framedata_image_region(framedata *frame, uint16_t region[4]);
+int framedata_bias_region(framedata *frame, uint16_t region[4]);
 
 #endif

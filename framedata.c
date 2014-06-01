@@ -13,6 +13,8 @@
 #include "framedata.h"
 #include "helpers.h"
 
+extern int verbosity;
+
 struct frame_metadata
 {
     char *key;
@@ -44,11 +46,63 @@ static int free_metadata_entry(any_t unused, any_t _meta)
     return MAP_OK;
 }
 
+static int load_and_fix_padding(const char *filename, uint8_t **framedata, size_t *length)
+{
+    *framedata = NULL;
+    *length = 0;
+
+    FILE *frame = fopen(filename, "r");
+    if (!frame)
+        return error("Unable to open frame %s", filename);
+
+    // Query file size
+    fseek(frame, 0L, SEEK_END);
+    size_t file_size = (size_t)ftell(frame);
+    fseek(frame, 0L, SEEK_SET);
+
+    size_t mem_size = 2880 * (file_size / 2880);
+    if (mem_size != file_size)
+    {
+        error("Warning: Truncated file detected: %s", filename);
+
+        // Add an extra block to hold the remainder plus padding
+        mem_size += 2880;
+    }
+
+    uint8_t *data = calloc(mem_size, sizeof(uint8_t));
+    if (!data)
+    {
+        fclose(frame);
+        return error("Unable to allocate %zu bytes for %s", mem_size, filename);
+    }
+
+    if (fread(data, sizeof(uint8_t), file_size, frame) != file_size)
+    {
+        free(data);
+        fclose(frame);
+        return error("Unable to read %zu bytes from %s", file_size, filename);
+    }
+
+    fclose(frame);
+
+    *framedata = data;
+    *length = mem_size;
+    return 0;
+}
+
+static void print_fits_error()
+{
+    char fitserr[128];
+    while (fits_read_errmsg(fitserr))
+        error("        %s\n", fitserr);
+}
+
 framedata *framedata_load(const char *filename)
 {
     int ret = 0;
     int status = 0;
     fitsfile *input;
+    uint8_t *padded_data = NULL;
 
     // Suppress unused variable warning
     (void)ret;
@@ -61,18 +115,46 @@ framedata *framedata_load(const char *filename)
 
     if (fits_open_image(&input, filename, READONLY, &status))
     {
-        char fitserr[128];
-        while (fits_read_errmsg(fitserr))
-            error("%s\n", fitserr);
+        if (verbosity >= 1)
+            print_fits_error();
 
-        error_jump(error, ret, "fits_open_image failed with error %d; %s", status, filename);
+        error_jump(error, ret, "        fits_open_image failed with error %d; %s", status, filename);
+    }
+
+    // The FITS specification requires files be an integer number of 2880 blocks.
+    // If the length doesn't match then the file may be corrupted or saved by
+    // software that violates the specification (e.g. Quilt).
+    //
+    // It is assumed that any uncompressed files that aren't an integer block size have
+    // been saved using Quilt, and are padded to the required length and re-opened.
+    // This may produce unexpected results if the frame was truncated for other reasons
+    // (e.g. interrupted transfer).
+
+    char type[20]; // MAX_PREFIX_LEN from cfitsio's cfileio.c
+    fits_url_type(input, type, &status);
+
+    if (strcmp("file://", type) == 0 && (input->Fptr->filesize % 2880) != 0)
+    {
+        size_t length = 0;
+        if (load_and_fix_padding(filename, &padded_data, &length))
+            error_jump(error, ret, "load_and_fix_padding failed for frame: %s", filename);
+
+        fits_close_file(input, &status);
+        if (fits_open_memfile(&input, filename, READONLY, (void **)(&padded_data), &length, 0, NULL, &status))
+        {
+            print_fits_error();
+            error_jump(error, ret, "fits_open_memfile failed with error %d; %s", status, filename);
+        }
     }
 
     // Query the image size
     fits_read_key(input, TINT, "NAXIS1", &fd->cols, NULL, &status);
     fits_read_key(input, TINT, "NAXIS2", &fd->rows, NULL, &status);
     if (status)
+    {
+        print_fits_error();
         error_jump(error, ret, "querying NAXIS failed");
+    }
 
     fd->data = (double *)malloc(fd->cols*fd->rows*sizeof(double));
     if (!fd->data)
@@ -84,7 +166,10 @@ framedata *framedata_load(const char *filename)
     // Load header keys
     int keyword_count = 0;
     if (fits_get_hdrspace(input, &keyword_count, NULL, &status))
+    {
+        print_fits_error();
         error_jump(error, ret, "fits_get_hdrspace failed");
+    }
 
     for (size_t i = 0; i < keyword_count; i++)
     {
@@ -95,7 +180,10 @@ framedata *framedata_load(const char *filename)
 
         // We're only interested in user keys
         if (fits_read_record(input, i + 1, card, &status))
+        {
+            print_fits_error();
             error_jump(error, ret, "Error reading card %zu", i);
+        }
 
         // Ignore keywords we aren't interested in
         int class = fits_get_keyclass(card);
@@ -103,12 +191,16 @@ framedata *framedata_load(const char *filename)
             continue;
 
         if (fits_read_keyn(input, i + 1, key, value, comment, &status))
+        {
+            print_fits_error();
             error_jump(error, ret, "Error reading key %zu", i);
+        }
 
         // Parse value
         char type;
         if (fits_get_keytype(value, &type, &status))
         {
+            print_fits_error();
             error("Unable to determine type for key '%s' - skipping.", key);
             continue;
         }
@@ -119,7 +211,10 @@ framedata *framedata_load(const char *filename)
             {
                 LONGLONG val;
                 if (ffc2jj(value, &val, &status))
+                {
+                    print_fits_error();
                     error_jump(error, ret, "Error parsing '%s' as integer", value);
+                }
 
                 framedata_put_metadata(fd, key, FRAME_METADATA_INT, &(int64_t){val}, comment);
                 break;
@@ -128,7 +223,10 @@ framedata *framedata_load(const char *filename)
             {
                 double val;
                 if (ffc2dd(value, &val, &status))
+                {
+                    print_fits_error();
                     error_jump(error, ret, "Error parsing '%s' as double", value);
+                }
 
                 framedata_put_metadata(fd, key, FRAME_METADATA_DOUBLE, &val, comment);
                 break;
@@ -137,7 +235,10 @@ framedata *framedata_load(const char *filename)
             {
                 int val;
                 if (ffc2ll(value, &val, &status))
+                {
+                    print_fits_error();
                     error_jump(error, ret, "Error parsing '%s' as boolean", value);
+                }
 
                 framedata_put_metadata(fd, key, FRAME_METADATA_BOOL, &(bool){val}, comment);
                 break;
@@ -146,23 +247,29 @@ framedata *framedata_load(const char *filename)
             {
                 char val[FLEN_VALUE];
                 if (ffc2s(value, val, &status))
+                {
+                    print_fits_error();
                     error_jump(error, ret, "Error parsing '%s' as type '%c'", value, type);
+                }
 
                 framedata_put_metadata(fd, key, FRAME_METADATA_STRING, val, comment);
                 break;
             }
         }
-
     }
 
     fits_close_file(input, &status);
+    if (padded_data)
+        free(padded_data);
 
     return fd;
 
 error:
-    framedata_free(fd);
-
     fits_close_file(input, &status);
+    framedata_free(fd);
+    if (padded_data)
+        free(padded_data);
+
     return NULL;
 }
 
@@ -206,7 +313,10 @@ int framedata_save(framedata *fd, const char *path)
 
     // Write the frame data to the image
     if (fits_write_img(out, TDOUBLE, 1, fd->rows*fd->cols, fd->data, &status))
+    {
+        print_fits_error();
         error("fits_write_img failed with status %d", status);
+    }
 
     fits_close_file(out, &status);
     return 0;
@@ -262,13 +372,22 @@ int framedata_get_metadata(framedata *fd, const char *key, int type, void *data)
         }
         case FRAME_METADATA_DOUBLE:
         {
-            // Allow int to be returned as double
-            if (metadata->type != FRAME_METADATA_DOUBLE &&
-                metadata->type != FRAME_METADATA_INT)
-                return FRAME_METADATA_INVALID_TYPE;
+            // Allow int and string to be returned as double
+            switch (metadata->type)
+            {
+                case FRAME_METADATA_DOUBLE: *(double *)data = metadata->value.d; break;
+                case FRAME_METADATA_INT: *(double *)data = (double)metadata->value.i; break;
+                case FRAME_METADATA_STRING:
+                {
+                    // Empty strings should be treated as a missing key
+                    if (strlen(metadata->value.s) == 0)
+                        return FRAME_METADATA_MISSING;
 
-            *(double *)data = metadata->type == FRAME_METADATA_DOUBLE ?
-                metadata->value.d : (double)metadata->value.i;
+                    *(double *)data = atof(metadata->value.s);
+                    break;
+                }
+            }
+
             return FRAME_METADATA_OK;
         }
         case FRAME_METADATA_BOOL:
@@ -383,19 +502,68 @@ int framedata_subtract_normalized(framedata *fd, framedata *other)
     return 0;
 }
 
-
 void framedata_subtract_bias(framedata *fd)
 {
-    struct frame_metadata *m;
-    if (hashmap_get(fd->metadata_map, "BIAS-RGN", (void**)(&m)) == MAP_MISSING)
-        return;
-
-    uint16_t br[4] = {0, 0, 0, 0};
-    sscanf(m->value.s, "[%hu, %hu, %hu, %hu]", &br[0], &br[1], &br[2], &br[3]);
-
+    uint16_t br[4];
+    framedata_bias_region(fd, br);
     double mean_bias = region_mean(br, fd->data, fd->cols);
     for (size_t i = 0; i < fd->rows*fd->cols; i++)
         fd->data[i] -= mean_bias;
+}
+
+int framedata_calibrate(framedata *frame, framedata *bias, framedata *dark, framedata *flat)
+{
+    if (bias)
+        framedata_subtract(frame, bias);
+    else
+        framedata_subtract_bias(frame);
+
+    if (dark)
+        if (framedata_subtract_normalized(frame, dark))
+            return error("Error dark-subtracting frame");
+
+    if (flat)
+        if (framedata_divide(frame, flat))
+            return error("Error flat-fielding frame");
+
+    return 0;
+}
+
+int framedata_calibrate_load(framedata *frame, const char *bias_path, const char *dark_path, const char *flat_path)
+{
+    int ret = 0;
+    framedata *bias = NULL;
+    framedata *dark = NULL;
+    framedata *flat = NULL;
+
+    if (bias_path)
+    {
+        bias = framedata_load(bias_path);
+        if (!bias)
+            error_jump(process_error, ret, "Error loading frame %s", bias_path);
+    }
+
+    if (dark_path)
+    {
+        dark = framedata_load(dark_path);
+        if (!dark)
+            error_jump(process_error, ret, "Error loading frame %s", dark_path);
+    }
+
+    if (flat_path)
+    {
+        flat = framedata_load(flat_path);
+        if (!flat)
+            error_jump(process_error, ret, "Error loading frame %s", flat_path);
+    }
+
+    ret = framedata_calibrate(frame, bias, dark, flat);
+
+process_error:
+    framedata_free(flat);
+    framedata_free(dark);
+
+    return ret;
 }
 
 int framedata_divide(framedata *fd, framedata *other)
@@ -450,9 +618,10 @@ void framedata_print_metadata(framedata *fd)
 int framedata_start_time(framedata *fd, ts_time *out_time)
 {
     struct frame_metadata *date, *time;
+
+    // Puoko-nui
     hashmap_get(fd->metadata_map, "UTC-DATE", (void **)(&date));
     hashmap_get(fd->metadata_map, "UTC-BEG", (void **)(&time));
-
     if (date && date->type == FRAME_METADATA_STRING &&
         time && time->type == FRAME_METADATA_STRING)
     {
@@ -460,7 +629,7 @@ int framedata_start_time(framedata *fd, ts_time *out_time)
         return 0;
     }
 
-    // Legacy keywords
+    // Puoko-nui (legacy)
     hashmap_get(fd->metadata_map, "GPSTIME", (void **)(&date));
     if (date && date->type == FRAME_METADATA_STRING)
     {
@@ -468,8 +637,17 @@ int framedata_start_time(framedata *fd, ts_time *out_time)
         return 0;
     }
 
-    // SBIG CCD-OPS timestamp
+    // Quilt
     hashmap_get(fd->metadata_map, "DATE-OBS", (void **)(&date));
+    hashmap_get(fd->metadata_map, "UTC", (void **)(&time));
+    if (date && date->type == FRAME_METADATA_STRING &&
+        time && time->type == FRAME_METADATA_STRING)
+    {
+        *out_time = parse_date_time(date->value.s, time->value.s);
+        return 0;
+    }
+
+    // SBIG CCD-OPS
     if (date && date->type == FRAME_METADATA_STRING)
     {
         *out_time = parse_time_ccdops(date->value.s);
@@ -489,6 +667,18 @@ int framedata_image_region(framedata *frame, uint16_t region[4])
     memcpy(region, r, 4*sizeof(uint16_t));
     return 0;
 }
+
+int framedata_bias_region(framedata *frame, uint16_t region[4])
+{
+    uint16_t r[4] = {0, 0, 0, 0};
+    char *str;
+    if (framedata_get_metadata(frame, "BIAS-RGN", FRAME_METADATA_STRING, &str) == FRAME_METADATA_OK)
+        sscanf(str, "[%hu, %hu, %hu, %hu]", &r[0], &r[1],
+                                            &r[2], &r[3]);
+    memcpy(region, r, 4*sizeof(uint16_t));
+    return 0;
+}
+
 
 static int sum_into_axes(framedata *frame, uint16_t region[4], double **x, double **y)
 {

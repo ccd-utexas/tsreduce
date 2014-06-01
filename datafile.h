@@ -47,6 +47,7 @@ typedef struct
     int version;
     char *frame_dir;
     char *frame_pattern;
+    char *bias_template;
     char *dark_template;
     char *flat_template;
     char *reference_frame;
@@ -59,7 +60,7 @@ typedef struct
     size_t obs_count;
     map_t filename_map;
 
-    uint8_t mma_filter_sigma;
+    uint8_t mmi_filter_sigma;
     uint8_t ratio_fit_degree;
     double plot_max_raw;
     double plot_max_dft;
@@ -85,8 +86,8 @@ struct photometry_data
     double scaled_target_max;
     double ratio_mean;
     double ratio_std;
-    double mma_mean;
-    double mma_std;
+    double mmi_mean;
+    double mmi_std;
     double fwhm_mean;
     double fwhm_std;
 
@@ -110,8 +111,8 @@ struct photometry_data
     double *ratio;
     double *ratio_noise;
     double *ratio_fit;
-    double *mma;
-    double *mma_noise;
+    double *mmi;
+    double *mmi_noise;
     size_t filtered_count;
 
     // Polynomial fit coefficients to ratio
